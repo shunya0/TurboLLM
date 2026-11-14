@@ -221,6 +221,8 @@ type CardCall = {
   args: Record<string, unknown>
   status: 'pending' | 'done' | 'error' | 'awaiting_approval'
   result?: string
+  /** run_python only: the images the run handed back (attachment references). */
+  files?: string[]
   /** Code mode only — pi's edit tool real diff output (turbollm/src/code/code-session.ts). */
   diff?: string
   /** Set only by the completed-message mapping below, which is the only place with SIBLING
@@ -260,6 +262,16 @@ function DiffView({ diff }: { diff: string }) {
   )
 }
 
+/** The images a run_python call handed back, shown under its card whether or not the card is expanded. */
+function ToolFiles({ files }: { files?: string[] }) {
+  if (!files?.length) return null
+  return (
+    <div className="flex flex-wrap gap-2 border-t border-border px-3 py-2">
+      {files.map((f) => <AttachmentImage key={f} attachment={f} />)}
+    </div>
+  )
+}
+
 function ToolCallCard({ call }: { call: CardCall }) {
   const [expanded, setExpanded] = useState(false)
   const hasDiff = !!call.diff?.trim()
@@ -292,6 +304,7 @@ function ToolCallCard({ call }: { call: CardCall }) {
           />
         )}
       </button>
+      <ToolFiles files={call.files} />
       {expanded && hasDiff && <DiffView diff={call.diff!} />}
       {expanded && !hasDiff && call.result && (
         <pre className="max-h-48 overflow-auto border-t border-border px-3 pb-3 pt-2 font-mono text-[11px] leading-relaxed text-muted whitespace-pre-wrap">
@@ -368,6 +381,7 @@ function InlineToolStep({ call, superseded }: { call: LiveToolCall; superseded?:
           />
         )}
       </button>
+      <ToolFiles files={call.files} />
       {expanded && hasDiff && <DiffView diff={call.diff!} />}
       {expanded && !hasDiff && call.result && (
         <pre className="max-h-48 overflow-auto border-t border-border px-3 pb-3 pt-2 font-mono text-[11px] leading-relaxed text-muted whitespace-pre-wrap">
@@ -917,6 +931,7 @@ export function MessageBubble({
     args: tc.args ?? {},
     status: tc.error ? 'error' : 'done',
     result: tc.error ?? tc.result,
+    files: tc.files,
     diff: tc.diff,
     // The two-phase update protocol leaves BOTH the preview and the apply in a finished
     // transcript. This mapping is the only place that sees the whole list, so it is the only
