@@ -43,6 +43,7 @@ import { getSysInfo } from '../sysinfo/sysinfo'
 import { noteLocalActivity } from '../link/host-idle'
 import { callChatUpstream, type ChatUpstream } from './chat-upstream'
 import { servingEngine, servingEngineKind } from '../engines/serving'
+import type { SandboxTurn } from '../sandbox/run-python'
 
 /** The reply as it stands mid-turn: what a progress save writes. */
 export interface ReplySnapshot {
@@ -101,6 +102,9 @@ export interface ApprovalPolicy {
   approvalWaitMinutes?(): number
   /** Interactive only: told true as a call starts waiting for its answer and false as the wait ends. */
   onApprovalWait?(waiting: boolean): void
+  /** The live chat's Python sandbox for this turn (GitHub #52), set only when its caller may run it: run_python is
+   *  offered to the model only with it, and runs only through it. */
+  sandbox?: SandboxTurn
 }
 
 /** The conversation fields the loop reads. */
@@ -473,7 +477,7 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
     // MCP server tools are left out (and refused below) for a caller that may not act on the host (the approval
     // policy's refuseMcp; for a chat turn, !isCodeAuthorized, the same isLocalRequest || real-key decision as adding
     // an MCP server).
-    const baseToolDefs = d.tools ? await d.tools.buildToolDefinitions({ forGeneration: true, refuseMcp: approval.refuseMcp ?? false }) : []
+    const baseToolDefs = d.tools ? await d.tools.buildToolDefinitions({ forGeneration: true, refuseMcp: approval.refuseMcp ?? false, sandbox: !!approval.sandbox }) : []
     // 'skill-creator' grants save_skill — the one tool a skill can add beyond the base
     // registry (every other skill is instructions text only). No-op unless enabled.
     // save_skill writes to the shared skill library, as POST /api/v1/skills and the Save as skill
@@ -818,6 +822,7 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
 
           let result: string
           let callError: string | undefined
+          let callFiles: string[] | undefined
 
           if (blocked !== undefined) {
             result = blocked
@@ -875,9 +880,11 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
               isCodeAuthorized: approval.isCodeAuthorized,
               refuseMcp: approval.refuseMcp,
               refuseMcpAgentsAndRoutines: approval.refuseMcpAgentsAndRoutines,
+              sandbox: approval.sandbox,
             })
             result = approved.result
             callError = approved.error
+            callFiles = approved.files
           }
 
           // F-021: track web_search calls and accumulate research sources.
@@ -908,7 +915,7 @@ export async function runGenerationCore<S = never>(d: Deps, turn: GenerationTurn
             } catch { /* parsing is best-effort */ }
           }
 
-          allToolCalls.push({ id: tc.id, name: tc.name, args: parsedArgs, result: callError ? undefined : result, error: callError })
+          allToolCalls.push({ id: tc.id, name: tc.name, args: parsedArgs, result: callError ? undefined : result, error: callError, ...(callFiles ? { files: callFiles } : {}) })
           replyChanged('toolCall')
 
           // Inject tool result into iterMessages
