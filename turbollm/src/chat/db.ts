@@ -399,12 +399,40 @@ export interface MessageStats {
   aborted: boolean
 }
 
+/** A file a run_python call handed back (GitHub #52). */
+export interface ToolOutput {
+  /** The name the code saved it under, made plain for showing and downloading (`résumé.csv` is `resume.csv`, and a
+   *  second `data.csv` beside `Data.csv` is `data-2.csv`). */
+  name: string
+  /** The name the code saved it under in the sandbox's folder, when `name` is not that name: a fresh sandbox gets the
+   *  file back under it, where the code looks for it. Never shown. */
+  sandboxName?: string
+  /** Its attachment reference (`attachment:<id>`). */
+  file: string
+  /** Its size in bytes. */
+  size: number
+  /** A CSV with a cell a spreadsheet may run as a formula (one starting with = + - @, a tab or a carriage return, that
+   *  is not a plain number). */
+  formulaCells?: true
+}
+
 export interface ToolCallRecord {
   id: string
   name: string
   args: Record<string, unknown>
   result?: string
   error?: string
+  /** run_python only (GitHub #52): the files the run handed back (images, and files for download), as attachment
+   *  references (`attachment:<id>`). The reply row's own `attachments` names them too, which is what the attachment
+   *  janitor keeps. */
+  files?: string[]
+  /** run_python only: each file in `files` as the code named it, for the user to see and download, and for a fresh
+   *  sandbox to get back under that name. */
+  outputs?: ToolOutput[]
+  /** run_python only: the files the run made that were not kept, because the chat's files reached their limit
+   *  (MAX_CHAT_FILES_BYTES), by the names the code gave them. Shown on the card: the result says so too, but its last
+   *  line is past what the card shows of a long result. */
+  notKept?: string[]
   /** Code mode only (pi's edit tool result) — a display-oriented diff and a standard unified
    *  patch of the change. Persisted so the diff panel and revert-to-message (code-routes.ts's
    *  revert endpoint) both still have this after a page reload, not just on the live SSE
@@ -935,9 +963,10 @@ export class ConversationStore {
     return row ? rowToMsg(row) : null
   }
 
-  updateMessage(id: string, patch: Partial<Pick<Message, 'content' | 'reasoning' | 'toolCalls' | 'timeline' | 'stats' | 'researchMeta' | 'edited'>>): boolean {
+  updateMessage(id: string, patch: Partial<Pick<Message, 'content' | 'reasoning' | 'attachments' | 'toolCalls' | 'timeline' | 'stats' | 'researchMeta' | 'edited'>>): boolean {
     const sets: string[] = []
     const params: Record<string, SqlValue> = { $id: id }
+    if (patch.attachments  !== undefined) { sets.push('attachments = $att');         params.$att          = JSON.stringify(patch.attachments) }
     if (patch.content      !== undefined) { sets.push('content = $content');         params.$content      = patch.content }
     if (patch.reasoning    !== undefined) { sets.push('reasoning = $reasoning');     params.$reasoning    = patch.reasoning }
     if (patch.toolCalls    !== undefined) { sets.push('tool_calls = $tc');           params.$tc           = JSON.stringify(patch.toolCalls) }

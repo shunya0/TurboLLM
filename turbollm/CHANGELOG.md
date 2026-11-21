@@ -23,7 +23,23 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **`run_python` chat tool** (Experimental, with the Python sandbox switched on and its runtime installed; desktop
+  only). A chat model can run Python (Pyodide inside Deno) on the files attached in the chat: pandas, numpy,
+  matplotlib, Pillow and sympy, with no network, no access to your files, no environment and no programs. Every run
+  asks first and shows the whole code, with **Allow once** only: Allow for this chat, Always Allow and Auto-allow all
+  do not apply to it, and a Deny in Tool permissions still blocks it. Charts and images it saves appear on the reply;
+  CSV, JSON and text come back to the model. A run is stopped after 60 seconds, and Python's memory is capped at
+  512 MB. Each chat keeps its own sandbox, closed after 10 minutes idle. Not offered to routines, Code sessions, the
+  External Chat API, remote-access tokens or keyless LAN callers.
+- **Files from `run_python` to download.** CSV, JSON, text and Python files a run saves now appear under its card as
+  download chips with their names and sizes, as well as coming back to the model. They are only ever served as
+  downloads, under their own extension, never opened as a page. A CSV with cells a spreadsheet may run as formulas
+  (starting with = + - or @) is marked with a warning. Files the code made come back into a fresh sandbox, so a
+  follow-up still finds `cleaned.csv` after the sandbox closed when idle. A chat keeps at most 500 MB of files;
+  deleting a message or the chat frees its files at the next daily cleanup. An exported chat carries no files and
+  says so, and an imported chat's tool calls cannot point at files.
 
 ## [1.15.2] - 2026-11-15
 

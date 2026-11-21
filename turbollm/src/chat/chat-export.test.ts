@@ -179,3 +179,12 @@ test('buildSnapshot: omits compaction field entirely when the conversation was n
   const snap = buildSnapshot(conv, makeCfg(), VERSION, EXPORTED_AT, 'export')
   assert.equal(snap.compaction, undefined)
 })
+
+test('buildSnapshot: says files are not included and leaves out the tool calls\' file references (GitHub #52)', () => {
+  const file = `attachment:${'a'.repeat(64)}.png`
+  const toolCalls = [{ id: 'tc1', name: 'run_python', args: { code: 'x' }, result: 'ok', files: [file], outputs: [{ name: 'chart.png', file, size: 8 }] }]
+  const snap = buildSnapshot(makeConv({ messages: [makeMsg('assistant', 'Here', { toolCalls })] }), makeCfg(), VERSION, EXPORTED_AT, 'export')
+  assert.equal(snap.files_included, false)
+  assert.deepEqual(snap.messages[0].tool_calls, [{ id: 'tc1', name: 'run_python', args: { code: 'x' }, result: 'ok' }])
+  assert.equal(toolCalls[0].files.length, 1, 'the chat\'s own record is not changed')
+})

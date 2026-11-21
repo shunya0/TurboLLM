@@ -10,12 +10,12 @@ import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
 import type { EmitSink } from './emit-sink.js'
 import type { ChatRun, ChatRunMeta } from './chat-runs.js'
 import type { ChatTurns } from './chat-turns.js'
-import { isAttachmentRef, isAudioAttachment, isCanonicalDataUrl } from './attachments.js'
+import { downloadFileName, isAttachmentRef, isAudioAttachment, isCanonicalDataUrl, isDownloadAttachmentRef, isImageAttachmentRef } from './attachments.js'
 import { buildEngineMessages, maybeAutoCompact, compactConversation, setAsideFrozenCut, userTurnContent, VOICE_MESSAGE_PLACEHOLDER, type EngineMessage } from './chat-compaction.js'
 
 import type { ConversationStore, Message, PageOpts, ToolCallRecord } from './db'
 import { InvalidCursorError } from './db'
-import { buildSnapshot } from './chat-export'
+import { buildSnapshot, withoutFileRefs } from './chat-export'
 import type { ExportFormat } from './chat-export'
 import { pendingToolApprovalName, resolveToolApproval } from '../tools/approval-gate'
 import { isMcpToolName, listsMcpTool, MCP_APPROVAL_REFUSED_MESSAGE } from '../tools/tool-registry'
@@ -29,6 +29,9 @@ import { engineTakesReasoningAsField, engineWithholdsVision, VISION_UNAVAILABLE 
 import { runGenerationCore } from './generation-core'
 import { nonStringField } from '../util/string-fields'
 import { conversationBodyError, CREATE_FIELDS, PATCH_FIELDS, patchFields } from './conversation-body.js'
+import { isSandboxEnabled } from '../sandbox/gate'
+import { resultBudget, sandboxTurn, type SandboxTurn } from '../sandbox/run-python'
+import { ALWAYS_ASK_TOOLS } from '../tools/tool-policy'
 
 /** The per-request code-routine trust decision. Exported ONLY so it can be behaviourally
  *  pinned — both generation entry points must call this, never inline the expression.
@@ -421,14 +424,22 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   // lanAuth admits the same callers, and a remote-access token needs models:use (auth.ts requiredCapability). The id
   // is checked against the one shape the store writes, so it can only name a file in the attachments folder. Its
   // name is the hash of its bytes, so it never changes: cacheable for good.
+  // A file run_python made for download (a CSV, JSON, text or Python file, GitHub #52) is only ever a download: saved
+  // under `?name=` (cleaned, and always with the file's own extension: attachments.ts downloadFileName), never shown
+  // on the daemon's origin, and sandboxed should a browser render it anyway.
   app.get('/api/v1/attachments/:id', async (c) => {
-    const file = db.attachments.file(c.req.param('id'))
+    const id = c.req.param('id')
+    const file = db.attachments.file(id)
     const bytes = file ? await readFile(file.path).catch(() => null) : null
     if (!file || !bytes) return err(c, 404, 'not_found', 'Attachment not found.')
+    const download: Record<string, string> = isDownloadAttachmentRef(`attachment:${id}`)
+      ? { 'Content-Disposition': contentDisposition(downloadFileName(c.req.query('name') ?? '', id)), 'Content-Security-Policy': 'sandbox' }
+      : {}
     return c.body(new Uint8Array(bytes), 200, {
       'Content-Type': file.mime,
       'Cache-Control': 'private, max-age=31536000, immutable',
       'X-Content-Type-Options': 'nosniff',
+      ...download,
     })
   })
 
@@ -478,7 +489,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   // Lists the tools currently available to the chat loop (name + description only —
   // no parameters schema; the frontend just needs this to render Tool Permissions).
   app.get('/api/v1/tools', async (c) => {
-    const defs = d.tools ? await d.tools.buildToolDefinitions() : []
+    const defs = d.tools ? await d.tools.buildToolDefinitions({ sandbox: isSandboxEnabled(d) && !!d.sandbox }) : []
     return c.json({ tools: defs.map((t) => ({ name: t.function.name, description: t.function.description ?? '' })) })
   })
 
@@ -497,6 +508,14 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
     const conv = db.getConversation(convId)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
+
+    // run_python asks before every run (tool-policy.ts ALWAYS_ASK_TOOLS): a standing approval for it would only be
+    // saved, never honored, and the client offers none. Refused rather than saved, by either name.
+    if (decision === 'allow_chat' || decision === 'always_allow') {
+      const pendingName = pendingToolApprovalName(`${convId}:${toolCallId}`)
+      if (ALWAYS_ASK_TOOLS.has(toolName) || (pendingName !== undefined && ALWAYS_ASK_TOOLS.has(pendingName)))
+        return err(c, 400, 'invalid_input', 'This tool can only be allowed one call at a time.')
+    }
 
     // A Code session's ask-mode approvals (bash/edit/write and the owner's MCP tools,
     // code-session.ts) wait on the same gate under the Code conversation's id, and are answered
@@ -605,6 +624,10 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // A clip is told from an image by what it is, not by the field it came in (chat-compaction.ts mediaPart): sent
     // as an image it would pass every check made on `audio` and still reach the engine as audio.
     if (images.some(isAudioAttachment)) return err(c, 400, 'invalid_input', 'A voice clip goes in audio, not in images.')
+    // A stored file stands in `images` only when it is an image: any other (a file run_python made for download,
+    // GitHub #52) would be sent to the engine as one.
+    if (images.some((a) => a.startsWith('attachment:') && !isImageAttachmentRef(a)))
+      return err(c, 400, 'invalid_input', 'Only images go in images.')
     // A message is valid if it has typed text OR carries an image, a voice clip or a file
     // attachment — image-only / voice-only / file-only sends are allowed.
     if (!content && images.length === 0 && audio.length === 0 && textAttachments.length === 0)
@@ -1113,7 +1136,11 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
         const role = m.role as string
         if (role !== 'user' && role !== 'assistant') continue
         const content = typeof m.content === 'string' ? m.content : ''
-        const toolCalls = Array.isArray(m.tool_calls) ? m.tool_calls as ToolCallRecord[] : undefined
+        // Without their file references (chat-export.ts withoutFileRefs): the file brings no files, and a reference in
+        // it could name another chat's. An entry that is not an object is skipped rather than crashing the import.
+        const toolCalls = Array.isArray(m.tool_calls)
+          ? withoutFileRefs((m.tool_calls as unknown[]).filter((t): t is ToolCallRecord => typeof t === 'object' && t !== null && !Array.isArray(t)))
+          : undefined
         db.addMessage(newConv.id, role as 'user' | 'assistant', content, {
           toolCalls: toolCalls && toolCalls.length > 0 ? toolCalls : undefined,
         })
@@ -1198,6 +1225,14 @@ function importOpenAiMessages(
   return c.json({ id: newConv.id }, 201)
 }
 
+/** A Content-Disposition that always downloads, under `name` (already cleaned: downloadFileName). `filename` is the
+ *  ASCII fallback for old clients; `filename*` carries the name as written (RFC 6266). */
+function contentDisposition(name: string): string {
+  const ascii = name.replace(/[^\x20-\x7e]/g, '_')
+  const encoded = encodeURIComponent(name).replace(/['()*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`)
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`
+}
+
 // ── LAN share target (F-023) ───────────────────────────────────────────────────
 
 /** Host + port to advertise in a chat share URL, and whether that URL is loopback-only
@@ -1280,6 +1315,28 @@ function localEngineWithholdsVision(d: Deps, upstream: ChatUpstream): boolean {
 // The engine's error, read and shown as every path shows it (engines/engine-error.ts).
 export { streamChunkError, engineErrorText } from '../engines/engine-error'
 
+/** This turn's Python sandbox (GitHub #52), or undefined when run_python must not be offered: the sandbox is off or
+ *  not installed, or the caller may not act on the host. That is the isLocalOrAuthenticated bar adding an MCP server
+ *  is held to (`isCodeAuthorized`, the same decision as refuseMcp): sandboxed code runs on this machine, and a remote
+ *  token or a keyless LAN, Serve or Access caller approving its own run must not get that. */
+function chatSandbox(d: Deps, convId: string, assistantId: string, isCodeAuthorized: boolean): SandboxTurn | undefined {
+  if (!isCodeAuthorized || !d.sandbox || !isSandboxEnabled(d) || !d.sandboxRuntime?.view().installed) return undefined
+  return sandboxTurn({
+    convId,
+    manager: d.sandbox,
+    store: d.db.attachments,
+    // The chat's active rows before this turn's placeholder, read at the call: the files every user message attached,
+    // and where the last run_python call was.
+    history: () => {
+      const msgs = d.db.getMessages(convId)
+      const at = msgs.findIndex((m) => m.id === assistantId)
+      return msgs.slice(0, at < 0 ? msgs.length : at)
+    },
+    // A run's result is sized to the loaded model's context, which a fixed cap did not fit.
+    resultChars: () => resultBudget(d.manager.status().model?.ctx),
+  })
+}
+
 /** The whole generation turn: engine call(s), tool loop, and the ONE write-back that persists
  *  the reply. Exported ONLY so tests can drive it with a sink of their own — the persistence
  *  invariant this function owns (GitHub #177: generated output must survive a failing sink, an
@@ -1335,17 +1392,23 @@ export async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx)
     }
   }
 
+  // The reply row names the images its run_python calls handed back (ToolCallRecord.files): the attachment janitor keeps
+  // only files some row's attachments name, so a deleted reply or chat frees them (GitHub #52).
+  const withFiles = <R extends { toolCalls: ToolCallRecord[] }>(reply: R) => {
+    const files = reply.toolCalls.flatMap((t) => t.files ?? [])
+    return files.length ? { ...reply, attachments: files } : reply
+  }
   const outcome = await runGenerationCore(d, ctx, {
     sink: emit,
     persistence: {
-      saveProgress: (reply) => { db.updateMessage(assistantMsg.id, reply) },
+      saveProgress: (reply) => { db.updateMessage(assistantMsg.id, withFiles(reply)) },
       trackProgressSave: (save) => {
         d.chatTurns.addReplySave(save)
         return () => d.chatTurns.removeReplySave(save)
       },
       restoreUnproduced,
       finalize: (reply) => {
-        db.updateMessage(assistantMsg.id, reply)
+        db.updateMessage(assistantMsg.id, withFiles(reply))
         db.touchConversation(convId)
         return db.getMessage(assistantMsg.id)!
       },
@@ -1373,6 +1436,7 @@ export async function runGeneration(d: Deps, emit: EmitSink, ctx: GenerationCtx)
       isCodeAuthorized: ctx.isCodeAuthorized,
       // An MCP call the model makes anyway, unoffered, is refused before any approval prompt.
       refuseMcp: !ctx.isCodeAuthorized,
+      sandbox: chatSandbox(d, convId, assistantMsg.id, ctx.isCodeAuthorized),
     },
     onSettled: () => d.chatTurns.release(convId, ac),
     onSaveSkill: () => saveSkillFromConversation(d, convId),
